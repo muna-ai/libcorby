@@ -355,3 +355,45 @@ fn explicit_runtime_lifecycle_and_scope_validation() {
     system.shutdown().unwrap();
     assert!(!endpoint.exists());
 }
+
+#[test]
+fn supervisor_work_keeps_predictor_registration_and_dedicated_intent_alive() {
+    use crate::{Context, Tenancy};
+    let context = Context(Arc::new(Coordinator::default()));
+    let shared = context
+        .register("shared", &[0, 1], 1, Tenancy::Shared, true)
+        .unwrap();
+    let dedicated = context
+        .register("dedicated", &[0, 1], 1, Tenancy::Shared, true)
+        .unwrap();
+    context
+        .set_engine_tenancy(dedicated.id(), Tenancy::Dedicated)
+        .unwrap();
+    assert_eq!(
+        context
+            .set_engine_tenancy(shared.id(), Tenancy::Dedicated)
+            .unwrap_err()
+            .0,
+        Status::Conflict
+    );
+    let work = context.begin_engine(dedicated.id()).unwrap();
+    let peer_work = shared.begin().unwrap();
+    assert_eq!(
+        peer_work.acquire(Some(Duration::ZERO)).err().unwrap().0,
+        Status::Timeout
+    );
+    assert_eq!(
+        context
+            .set_engine_tenancy(dedicated.id(), Tenancy::Shared)
+            .unwrap_err()
+            .0,
+        Status::Busy
+    );
+    let id = dedicated.id();
+    drop(dedicated);
+    assert_eq!(context.engine_stats(id).unwrap().active_work, 1);
+    drop(work);
+    assert_eq!(context.engine_stats(id).err().unwrap().0, Status::NotFound);
+    assert!(peer_work.acquire(Some(Duration::ZERO)).is_ok());
+    assert_eq!(context.begin_engine(id).err().unwrap().0, Status::NotFound);
+}

@@ -28,6 +28,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+The host may also supervise an engine registered by a predictor. After finding
+its ID through `engine_ids`, `engine_label` and `engine_devices`, set its tenancy
+with `set_engine_tenancy(id, Tenancy::Dedicated)` before admitting requests.
+`begin_engine(id)` holds invocation-wide work intent on that same registration;
+retain it until native execution and stream cleanup finish, including after a
+caller disconnects. The returned work owns the registration internally. Tenancy
+changes require an idle engine and validate all overlapping device groups.
+
 `RuntimeScope::Process` is the default. A process-private rendezvous publishes
 an immutable C dispatch table. Stubs discover it once and thereafter make direct
 calls; Rust structs, locks, allocator state and scheduling policy stay private.

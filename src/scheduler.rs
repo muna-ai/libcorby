@@ -1,11 +1,11 @@
-/* 
+/*
 *   Corby
 *   Copyright © 2026 NatML Inc. All rights reserved.
 */
 
 //! Private scheduling state. No layout in this module crosses the C boundary.
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use crate::{Status, CAP_COOPERATIVE, TENANCY_DEDICATED};
@@ -25,6 +25,7 @@ struct Held {
 }
 
 pub(crate) struct Entry {
+    pub engine: Weak<Engine>,
     pub label: String,
     pub devices: Vec<i32>,
     pub weight: u32,
@@ -41,7 +42,6 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-
     pub fn stats(&self) -> crate::EngineStats {
         crate::EngineStats {
             size: std::mem::size_of::<crate::EngineStats>() as u32,
@@ -224,9 +224,14 @@ impl Coordinator {
             return Err(Status::Unsupported);
         }
         let id = state.id()?;
+        let engine = Arc::new(Engine {
+            coordinator: self.clone(),
+            id,
+        });
         state.entries.insert(
             id,
             Entry {
+                engine: Arc::downgrade(&engine),
                 label,
                 devices,
                 weight,
@@ -242,10 +247,7 @@ impl Coordinator {
                 held: None,
             },
         );
-        Ok(Arc::new(Engine {
-            coordinator: self.clone(),
-            id,
-        }))
+        Ok(engine)
     }
 }
 
@@ -306,7 +308,6 @@ impl Drop for Engine {
 }
 
 impl Work {
-
     /// Cancel the work item.
     pub fn cancel(&self) -> Result<(), Status> {
         *self
@@ -426,7 +427,6 @@ impl Drop for Work {
 }
 
 impl Lease {
-
     /// Check if the lease should yield.
     pub fn should_yield(&self, min_hold_ns: u64) -> Result<bool, Status> {
         let coordinator = &self.work.engine.coordinator;

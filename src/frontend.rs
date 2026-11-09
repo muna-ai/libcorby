@@ -1,4 +1,4 @@
-/* 
+/*
 *   Corby
 *   Copyright © 2026 NatML Inc. All rights reserved.
 */
@@ -12,7 +12,6 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error(pub Status);
 impl std::fmt::Display for Error {
-
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Corby {:?}", self.0)
     }
@@ -38,7 +37,6 @@ pub struct Work<'engine>(Arc<scheduler::Work>, PhantomData<&'engine Engine>);
 pub struct Lease<'work>(scheduler::Lease, PhantomData<&'work ()>);
 
 impl Context {
-
     /// Register a new engine with the context.
     pub fn register(
         &self,
@@ -58,6 +56,55 @@ impl Context {
             u32::from(matches!(tenancy, Tenancy::Dedicated)),
             if cooperative { CAP_COOPERATIVE } else { 0 },
         )?))
+    }
+
+    /// Hold invocation-wide intent on an existing predictor registration.
+    /// The work owns the engine internally and may outlive this context.
+    pub fn begin_engine(&self, id: u64) -> Result<Work<'static>> {
+        let engine = self
+            .0
+            .lock()?
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.engine.upgrade())
+            .ok_or(Status::NotFound)?;
+        Ok(Work(engine.begin()?, PhantomData))
+    }
+
+    /// Set host policy before admitting invocations. A tenancy change requires
+    /// an idle engine and validates the entire overlapping device group.
+    pub fn set_engine_tenancy(&self, id: u64, tenancy: Tenancy) -> Result<()> {
+        let tenancy = u32::from(matches!(tenancy, Tenancy::Dedicated));
+        let mut state = self.0.lock()?;
+        let entry = state.entries.get(&id).ok_or(Status::NotFound)?;
+        if entry.retiring {
+            return Err(Status::Retired.into());
+        }
+        if entry.tenancy == tenancy {
+            return Ok(());
+        }
+        if entry.works != 0 {
+            return Err(Status::Busy.into());
+        }
+        if tenancy == crate::TENANCY_DEDICATED {
+            if entry.capabilities & CAP_COOPERATIVE == 0 {
+                return Err(Status::Unsupported.into());
+            }
+            for (&peer_id, peer) in &state.entries {
+                if peer_id == id || !peer.devices.iter().any(|d| entry.devices.contains(d)) {
+                    continue;
+                }
+                if peer.tenancy == crate::TENANCY_DEDICATED {
+                    return Err(Status::Conflict.into());
+                }
+                if peer.capabilities & CAP_COOPERATIVE == 0 {
+                    return Err(Status::Unsupported.into());
+                }
+            }
+        }
+        state.entries.get_mut(&id).ok_or(Status::NotFound)?.tenancy = tenancy;
+        self.0.notify();
+        Ok(())
     }
 
     /// Get all engine IDs registered with the context.
@@ -117,7 +164,6 @@ impl Context {
 }
 
 impl Engine {
-
     /// Get the ID of the engine.
     pub fn id(&self) -> u64 {
         self.0.id
@@ -145,7 +191,6 @@ impl Engine {
 }
 
 impl Work<'_> {
-
     /// Acquire a lease for the work item.
     pub fn acquire(&self, timeout: Option<Duration>) -> Result<Lease<'_>> {
         let ns = match timeout {
@@ -163,7 +208,6 @@ impl Work<'_> {
 }
 
 impl Lease<'_> {
-
     /// Check if the lease should yield.
     pub fn should_yield(&self, min_hold: Duration) -> Result<bool> {
         Ok(self
