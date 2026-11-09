@@ -1,0 +1,15 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/CorbyTargets.cmake")
+if(@CORBY_BUILD_RUNTIME@ AND NOT TARGET Corby::runtime)
+    add_library(Corby::runtime SHARED IMPORTED)
+    set_target_properties(Corby::runtime PROPERTIES
+        IMPORTED_LOCATION "@PACKAGE_CMAKE_INSTALL_LIBDIR@/@CMAKE_SHARED_LIBRARY_PREFIX@corby@CMAKE_SHARED_LIBRARY_SUFFIX@"
+        INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+    if(APPLE)
+        set_target_properties(Corby::runtime PROPERTIES IMPORTED_SONAME "@rpath/libcorby.dylib")
+    else()
+        set_target_properties(Corby::runtime PROPERTIES IMPORTED_SONAME "libcorby.so")
+    endif()
+endif()

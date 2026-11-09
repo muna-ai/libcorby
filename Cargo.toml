@@ -1,0 +1,24 @@
+[workspace]
+members = ["."]
+default-members = ["."]
+resolver = "2"
+
+[package]
+name = "corby"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+description = "Host-owned cooperative device scheduling with process and system scopes"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[lib]
+name = "corby"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+panic = "unwind"
+lto = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
