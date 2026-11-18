@@ -1,4 +1,4 @@
-/* 
+/*
 *   Corby
 *   Copyright © 2026 NatML Inc. All rights reserved.
 */
@@ -33,7 +33,6 @@ pub struct RuntimeOptions {
 }
 
 impl Inner {
-
     /// Remove the endpoint file.
     fn remove_endpoint(&self) {
         if let Some(path) = &self.endpoint {
@@ -115,7 +114,6 @@ pub(crate) fn private_directory() -> std::result::Result<PathBuf, Status> {
 }
 
 impl Runtime {
-
     /// Start the runtime.
     pub fn start(options: RuntimeOptions) -> Result<Self> {
         if options.scope == RuntimeScope::Process && options.endpoint.is_some() {
@@ -167,9 +165,6 @@ impl Runtime {
                 })?;
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                    .map_err(|_| Error(Status::Unavailable))?;
-                listener
-                    .set_nonblocking(true)
                     .map_err(|_| Error(Status::Unavailable))?;
                 Some(listener)
             }
@@ -233,6 +228,11 @@ impl Runtime {
             return Err(Status::Busy.into());
         }
         self.inner.stopping.store(true, Ordering::Release);
+        // Wake blocking accept before removing the endpoint. New IPC messages
+        // are dispatched on arrival, without a periodic accept/sweep tick.
+        if let Some(endpoint) = &self.inner.endpoint {
+            let _ = std::os::unix::net::UnixStream::connect(endpoint);
+        }
         self.inner
             .publication
             .lock()

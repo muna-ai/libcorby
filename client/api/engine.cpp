@@ -27,7 +27,7 @@ cor_status_t cor_engine_register(
         auto status = prefix(options, offsetof(cor_engine_options_t, capabilities) + 8, size);
         if (status)
             return status;
-        if (options->reserved || (options->capabilities & ~COR_CAP_COOPERATIVE_YIELD))
+        if (options->reserved || (options->capabilities & ~(COR_CAP_COOPERATIVE_YIELD | COR_CAP_MEMORY_RECLAIM)))
             return COR_UNSUPPORTED;
         if (!options->label || !options->device_ids || !options->device_count ||
             options->device_count > 4096)
@@ -76,6 +76,8 @@ cor_status_t cor_engine_unregister(cor_engine_t* handle) {
         if (!handle)
             return COR_OK;
         auto c = handle->client;
+        if (const auto status = handle->callbacks->close(); status)
+            return status;
         cor_status_t status;
         if (c->api)
             status = c->api->engine_unregister(native<cor_engine_t>(handle->id));
@@ -84,8 +86,13 @@ cor_status_t cor_engine_unregister(cor_engine_t* handle) {
             args.u64(handle->id);
             status = c->rpc(10, std::move(args), response);
         }
-        if (!status)
+        if (!status) {
+            c->unwatch(102, handle->id);
             delete handle;
+        } else {
+            std::lock_guard guard(handle->callbacks->mutex);
+            handle->callbacks->closed = false;
+        }
         return status;
     });
 }

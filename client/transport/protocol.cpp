@@ -82,23 +82,33 @@ bool send_frame(
     frame.bytes.insert(frame.bytes.end(), body.begin(), body.end());
     return transfer(fd, frame.bytes.data(), frame.bytes.size(), true);
 }
-bool read_frame(
+bool read_any_frame(
     int fd,
-    uint32_t opcode,
+    uint32_t& opcode,
     Buffer& out
 ) {
     Buffer header;
     header.bytes.resize(16);
     if (!transfer(fd, header.bytes.data(), 16, false))
         return false;
-    if (header.get(4) != MAGIC || header.get(4) != 1 || header.get(4) != opcode)
+    if (header.get(4) != MAGIC || header.get(4) != 1)
         return false;
+    opcode = static_cast<uint32_t>(header.get(4));
     const auto length = header.get(4);
     if (length > LIMIT)
         return false;
     out.bytes.resize(length);
     out.offset = 0;
     return transfer(fd, out.bytes.data(), out.bytes.size(), false);
+}
+
+bool read_frame(
+    int fd,
+    uint32_t opcode,
+    Buffer& out
+) {
+    uint32_t actual = 0;
+    return read_any_frame(fd, actual, out) && actual == opcode;
 }
 
 } // namespace corby::client

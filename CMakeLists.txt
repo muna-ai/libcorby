@@ -14,6 +14,9 @@ endif()
 
 # Define the client library
 add_library(corby_client STATIC
+    client/api/callbacks.cpp
+    client/api/extensions.cpp
+    client/api/memory.cpp
     client/api/context.cpp
     client/api/engine.cpp
     client/api/lease.cpp
@@ -83,7 +86,7 @@ install(
 if(CORBY_BUILD_RUNTIME)
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     set(CORBY_LIBRARY "${CMAKE_CURRENT_BINARY_DIR}/cargo/release/${CMAKE_SHARED_LIBRARY_PREFIX}corby${CMAKE_SHARED_LIBRARY_SUFFIX}")
-    file(GLOB CORBY_RUST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.rs")
+    file(GLOB_RECURSE CORBY_RUST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.rs")
     add_custom_command(
         OUTPUT "${CORBY_LIBRARY}"
         COMMAND "${CARGO_EXECUTABLE}" build --release --offline --locked
@@ -135,6 +138,14 @@ if(CORBY_BUILD_TESTS)
             )
             add_test(NAME ${test} COMMAND corby_${test}_test)
         endforeach()
+        add_executable(corby_memory_test tests/memory.cpp)
+        target_link_libraries(corby_memory_test PRIVATE Corby::client Corby::runtime)
+        add_executable(corby_memory_worker tests/memory.cpp)
+        target_compile_definitions(corby_memory_worker PRIVATE CORBY_MEMORY_WORKER=1)
+        target_link_libraries(corby_memory_worker PRIVATE Corby::client)
+        add_dependencies(corby_memory_test corby_memory_worker)
+        add_test(NAME memory_leases COMMAND corby_memory_test "$<TARGET_FILE:corby_memory_worker>")
+        set_tests_properties(memory_leases PROPERTIES TIMEOUT 30 ENVIRONMENT "CORBY_ENDPOINT=")
         foreach(plugin IN ITEMS a b)
             add_library(corby_plugin_${plugin} MODULE tests/plugin.c)
             target_link_libraries(corby_plugin_${plugin} PRIVATE Corby::client)

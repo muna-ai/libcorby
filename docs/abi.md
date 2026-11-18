@@ -46,7 +46,7 @@ the runtime incarnation, are not pointers, and do not retain registrations.
 A stale ID returns NotFound. Different incarnations never share sessions.
 
 Same-user socket credentials and unpredictable session tokens authenticate
-connections. One control connection carries asynchronous yield notifications;
+connections. One control connection carries asynchronous yield, acquisition and memory notifications;
 RPCs have independent streams so a pending acquire never obstructs cancel or
 release. Current limits are 64 KiB per frame, 4096 engines/devices per group,
 4096-byte UTF-8 labels, and 128 concurrent server connections (including control
@@ -65,13 +65,15 @@ A successful consuming call destroys its handle; Busy leaves it valid. NULL
 teardown is allowed. Other pointers must be valid, aligned and cover the stated
 sizes. Synchronize destruction with every use of that handle. Cancellation may
 race acquire; work_end may not. Multiple work scopes per engine are supported,
-but only one acquisition or lease may be outstanding. Rust frontend lifetimes
+but only one acquisition or lease may be outstanding per resource domain. Rust frontend lifetimes
 prevent normal work/lease parent destruction; C/C++ callers obey this explicitly.
 
-Release means every associated device stream has drained. Corby cannot verify
+Releasing compute permission means every associated device stream has drained.
+Releasing memory permission means backing allocation calls have finished. Corby cannot verify
 this and does not depend on CUDA. TP engines acquire/release the whole group
 from one coordinator rank, synchronizing ranks before release and after grant.
-Never wait on another engine's progress while holding a lease. Cooperative
+Do not block compute holders behind a memory lease they must help reclaim;
+use memory-before-compute ordering when both resources are needed. Cooperative
 capabilities are engine promises; a client that ignores yield requests can
 prevent progress. No forced GPU permission reclamation is attempted.
 
@@ -81,3 +83,20 @@ recoverable. Allocation exhaustion/process-fatal failures are outside recovery.
 Internal transport failures preserve uncertain ownership. If the runtime dies,
 clients must stop new GPU admission and drain; a supervisor fences old workers
 before a replacement can grant permission safely.
+
+## Optional memory/async extensions
+
+The ABI-v1 dispatch table appends resource-specific work, extended acquisition,
+acquisition query/callback and reclamation operations after the frozen original
+prefix. Slot size and negotiated feature bits are both checked before access.
+Existing compute calls and original size prefixes remain supported. The v1
+waiting/holding/grant/time snapshots retain compute semantics; memory state
+is reported through its own lease/progress APIs. New flags
+or intents that are not understood are rejected, not silently downgraded.
+
+A pending lease is not permission; cancellation and deadline expiry cannot
+revoke a granted lease. Successful release fences queued callbacks, while an
+executing callback makes consuming release busy. All callbacks execute outside
+scheduler locks and must return promptly. Reclamation recipients own opaque
+tickets until completion even after requester cancellation; round IDs and
+participant sets remain private. See [memory coordination](memory.md).

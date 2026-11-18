@@ -49,6 +49,14 @@ by supervisor commands are separate backend IDs.
 | 17 | Acquire group | u64 work, u64 relative timeout ns | u64 lease |
 | 18 | Query yield | u64 lease, u64 minimum hold ns | u32 boolean |
 | 19 | Release lease | u64 lease | none |
+| 20 | Begin resource work | u64 engine, u32 resource, u32 intent | u64 work |
+| 21 | Extended acquire | u64 work, u32 flags, u64 timeout ns | u64 pending/terminal lease |
+| 22 | Acquisition status | u64 lease | status only (Pending/OK/failure) |
+| 23 | Set memory warning delivery | u64 engine, u32 enabled | none |
+| 24 | Request reclamation | u64 lease, u64 timeout ns, u32 count, repeated (i32 device, u64 bytes) | none |
+| 25 | Reclamation requirements | u64 recipient ticket | u32 count, repeated (i32 device, u64 bytes) |
+| 26 | Complete recipient ticket | u64 ticket, i32 outcome, u64 released bytes | none |
+| 27 | Enable acquisition completion | u64 lease | none |
 
 Operations 1/2 are reserved for local context lifecycle; System contexts use the
 control stream. Destroying a local context does not close the System session
@@ -77,3 +85,32 @@ the control stream cancels waits and quarantines uncertain held leases. It does
 not prove GPU completion. No lease expiry, disconnect-triggered regrant, or
 transparent runtime failover exists. A supervisor must fence old workers and
 confirm cleanup before starting replacement coordination.
+
+## Acquisition and memory push
+
+Operations 20–27 are optional ABI-v1 extensions gated by the memory/async
+feature bits. Existing command layouts are frozen. Up to 4096 per-device
+requirements are accepted. There are no wire pointers, round IDs, native
+callbacks, CUDA structures or mapped scheduler layouts.
+
+Additional unsolicited control frames have no status prefix:
+
+| Op | Notification | Payload |
+|---|---|---|
+| 101 | Acquisition completed | u64 lease, i32 terminal status |
+| 102 | Reclamation warning | u64 recipient engine, u64 owning recipient ticket |
+| 103 | Reclamation progress | u64 lease, u32 pending, u32 completed, u32 failed, i32 status, u64 released bytes |
+
+Clients install local listeners before enabling delivery through operations
+27, 23 and 24 respectively. A completed lease immediately reports its outcome
+when operation 27 is handled; this closes the completion-before-registration
+race. Notification writes run on a separate bounded per-session sender, never
+under scheduler locks. Slow peers are disconnected. The IPC listener accepts
+connections without a polling interval. The legacy yield sampler remains
+separate; memory and acquisition notifications bypass it entirely.
+
+Pending acquisitions are cancelled on disconnect. Grants whose delivery is
+uncertain remain quarantined; neither cancellation nor loss of the socket
+proves device completion. Recipient tickets dropped on disconnect acknowledge
+failure, not successful release. Requester release suppresses local progress
+without invalidating tickets already delivered to other sessions.

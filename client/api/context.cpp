@@ -20,7 +20,7 @@ uint32_t cor_abi_version(void) {
 }
 
 uint64_t cor_features(void) {
-    return 15;
+    return 63;
 }
 
 cor_status_t cor_context_create(
@@ -62,7 +62,10 @@ cor_status_t cor_context_create(
             const auto status = static_cast<cor_status_t>(response.get(4));
             if (status)
                 return status;
-            if (response.bytes.size() != 28 || (required & ~response.get(8)))
+            if (response.bytes.size() != 28)
+                return COR_UNSUPPORTED;
+            client->features = response.get(8);
+            if (required & ~client->features)
                 return COR_UNSUPPORTED;
             client->token.assign(response.bytes.begin() + 12, response.bytes.end());
             client->reader = std::thread([raw = client.get()] {
@@ -72,6 +75,7 @@ cor_status_t cor_context_create(
             client->api = discover_dispatch();
             if (!client->api)
                 return COR_UNAVAILABLE;
+            client->features = client->api->features;
             const cor_context_options_t core{
                 .size = 16,
                 .abi_version = COR_ABI_VERSION,

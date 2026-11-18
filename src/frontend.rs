@@ -36,6 +36,39 @@ pub struct Engine(pub(crate) Arc<scheduler::Engine>);
 pub struct Work<'engine>(Arc<scheduler::Work>, PhantomData<&'engine Engine>);
 pub struct Lease<'work>(scheduler::Lease, PhantomData<&'work ()>);
 
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Resource {
+    #[default]
+    Compute,
+    Memory,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub enum WorkIntent {
+    #[default]
+    Required,
+    Initialization,
+    Opportunistic,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AcquisitionOptions {
+    pub timeout: Option<Duration>,
+    pub asynchronous: bool,
+}
+/// A recipient's completion obligation. Move this onto the engine's own
+/// execution thread, release safe-to-reclaim backing, then complete it.
+/// Dropping an uncompleted request acknowledges cancellation, never success.
+pub struct MemoryRequest(Arc<scheduler::Reclaim>);
+
+fn timeout_ns(timeout: Option<Duration>) -> Result<u64> {
+    match timeout {
+        None => Ok(u64::MAX),
+        Some(d) => u64::try_from(d.as_nanos())
+            .ok()
+            .filter(|&n| n < u64::MAX)
+            .ok_or_else(|| Status::InvalidArgument.into()),
+    }
+}
+
 impl Context {
     /// Register a new engine with the context.
     pub fn register(
@@ -174,6 +207,29 @@ impl Engine {
         Ok(Work(self.0.begin()?, PhantomData))
     }
 
+    /// Resource domains have independent exclusion. Initialization intent
+    /// suppresses opportunistic regrowth between this work's memory leases.
+    pub fn begin_ex(&self, resource: Resource, intent: WorkIntent) -> Result<Work<'_>> {
+        Ok(Work(
+            self.0.begin_ex(resource as usize, intent as u32)?,
+            PhantomData,
+        ))
+    }
+
+    /// The callback is a notification: enqueue the request and return promptly.
+    /// Replacing/removing an executing handler returns Busy.
+    pub fn set_memory_handler<F>(&self, handler: F) -> Result<()>
+    where
+        F: Fn(MemoryRequest) + Send + Sync + 'static,
+    {
+        Ok(self
+            .0
+            .set_memory_handler(Some(Arc::new(move |r| handler(MemoryRequest(r)))))?)
+    }
+    pub fn clear_memory_handler(&self) -> Result<()> {
+        Ok(self.0.set_memory_handler(None)?)
+    }
+
     /// Retire the engine.
     pub fn retire(&self) -> Result<()> {
         Ok(self.0.retire()?)
@@ -193,14 +249,17 @@ impl Engine {
 impl Work<'_> {
     /// Acquire a lease for the work item.
     pub fn acquire(&self, timeout: Option<Duration>) -> Result<Lease<'_>> {
-        let ns = match timeout {
-            None => u64::MAX,
-            Some(d) => u64::try_from(d.as_nanos())
-                .ok()
-                .filter(|&n| n < u64::MAX)
-                .ok_or(Status::InvalidArgument)?,
-        };
+        let ns = timeout_ns(timeout)?;
         Ok(Lease(self.0.acquire(ns)?, PhantomData))
+    }
+    /// An async result is an owned pending lease, not permission to allocate
+    /// or compute. Check acquired() or install a completion handler first.
+    pub fn acquire_ex(&self, options: AcquisitionOptions) -> Result<Lease<'_>> {
+        let lease = self.0.acquire_ex(timeout_ns(options.timeout)?)?;
+        if !options.asynchronous {
+            lease.wait()?;
+        }
+        Ok(Lease(lease, PhantomData))
     }
     pub fn cancel(&self) -> Result<()> {
         Ok(self.0.cancel()?)
@@ -208,10 +267,50 @@ impl Work<'_> {
 }
 
 impl Lease<'_> {
+    pub fn acquired(&self) -> Result<()> {
+        Ok(self.0.acquired()?)
+    }
+    pub fn wait(&self) -> Result<()> {
+        Ok(self.0.wait()?)
+    }
+    /// Exactly once, including failures. A completed lease may invoke inline.
+    /// Callbacks run outside scheduler locks and should enqueue work promptly.
+    pub fn register_handler<F>(&self, handler: F) -> Result<()>
+    where
+        F: Fn(Status) + Send + Sync + 'static,
+    {
+        Ok(self.0.register_handler(Arc::new(handler))?)
+    }
+    pub fn reclaim_memory<F>(
+        &self,
+        requirements: &[crate::MemoryRequirement],
+        timeout: Option<Duration>,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(crate::MemoryProgress) + Send + Sync + 'static,
+    {
+        Ok(self.0.reclaim_memory(
+            requirements.to_vec(),
+            timeout_ns(timeout)?,
+            Arc::new(handler),
+        )?)
+    }
     /// Check if the lease should yield.
     pub fn should_yield(&self, min_hold: Duration) -> Result<bool> {
         Ok(self
             .0
             .should_yield(min_hold.as_nanos().min(u64::MAX as u128) as u64)?)
+    }
+}
+
+impl MemoryRequest {
+    pub fn requirements(&self) -> Vec<crate::MemoryRequirement> {
+        self.0.requirements()
+    }
+    /// Report only after device work is synchronized and backing is released.
+    /// Byte counts are telemetry, not a guarantee that a subsequent allocation succeeds.
+    pub fn complete(self, outcome: Status, released_bytes: u64) -> Result<()> {
+        Ok(self.0.complete(outcome, released_bytes)?)
     }
 }

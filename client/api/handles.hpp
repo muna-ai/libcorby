@@ -8,6 +8,7 @@
 #include <chrono>
 #include <memory>
 
+#include "api/callbacks.hpp"
 #include "transport/connection.hpp"
 
 namespace corby::client {
@@ -28,9 +29,15 @@ T* native(uint64_t id) {
 struct cor_context {
     std::shared_ptr<corby::client::Connection> client;
 };
-struct cor_engine : corby::client::Handle {};
-struct cor_work : corby::client::Handle {};
+struct cor_engine : corby::client::Handle {
+    std::shared_ptr<corby::client::Callbacks> callbacks = std::make_shared<corby::client::Callbacks>();
+};
+struct cor_work : corby::client::Handle { uint32_t resource = COR_RESOURCE_COMPUTE; };
 struct cor_lease : corby::client::Handle {
     std::shared_ptr<std::atomic<uint32_t>> flags;
     corby::client::Clock::time_point started;
+    uint32_t resource = COR_RESOURCE_COMPUTE;
+    std::shared_ptr<corby::client::Callbacks> callbacks = std::make_shared<corby::client::Callbacks>();
 };
+
+struct cor_reclaim : corby::client::Handle {};

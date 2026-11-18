@@ -1,23 +1,28 @@
-/* 
+/*
 *   Corby
 *   Copyright © 2026 NatML Inc. All rights reserved.
 */
 
 #![allow(clippy::missing_safety_doc)] // The installed C header defines pointer contracts.
 
+mod extensions;
 mod frontend;
+pub use extensions::*;
 mod ipc;
 mod runtime;
 mod scheduler;
-pub use frontend::{Context, Engine, Error, Lease, Result, Tenancy, Work};
+pub use frontend::{
+    AcquisitionOptions, Context, Engine, Error, Lease, MemoryRequest, Resource, Result, Tenancy,
+    Work, WorkIntent,
+};
 pub use runtime::{Runtime, RuntimeOptions, RuntimeScope};
+pub use scheduler::{MemoryProgress, Requirement as MemoryRequirement};
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod tests;
 
-use scheduler::{
-    Coordinator, Engine as BackendEngine,
-    Lease as BackendLease, Work as BackendWork
-};
+use scheduler::{Coordinator, Engine as BackendEngine, Lease as BackendLease, Work as BackendWork};
 use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
@@ -26,7 +31,8 @@ use std::sync::Arc;
 pub const ABI_VERSION: u32 = 1;
 pub const CAP_COOPERATIVE: u64 = 1;
 pub const TENANCY_DEDICATED: u32 = 1;
-pub const FEATURES: u64 = 0x0f; // groups, dedicated demand, cancellation, weighted fairness
+pub const CAP_MEMORY_RECLAIM: u64 = 2;
+pub const FEATURES: u64 = 0x3f; // groups, dedicated demand, cancellation, fairness, memory, async
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +48,7 @@ pub enum Status {
     Internal = 8,
     NotFound = 9,
     Unavailable = 10,
+    Pending = 11,
 }
 
 #[repr(C)]
@@ -93,7 +100,12 @@ fn boundary(f: impl FnOnce() -> std::result::Result<(), Status>) -> i32 {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(Ok(())) => Status::Ok as i32,
         Ok(Err(status)) => status as i32,
-        Err(_) => Status::Internal as i32,
+        Err(_) => {
+            if let Some(coordinator) = runtime::active_coordinator() {
+                coordinator.cancel_all();
+            }
+            Status::Internal as i32
+        }
     }
 }
 
@@ -346,7 +358,9 @@ pub unsafe extern "C" fn cor_engine_register(
                 capabilities: ptr::addr_of!((*options).capabilities).read_unaligned(),
             }
         };
-        if options.reserved != 0 || options.capabilities & !CAP_COOPERATIVE != 0 {
+        if options.reserved != 0
+            || options.capabilities & !(CAP_COOPERATIVE | CAP_MEMORY_RECLAIM) != 0
+        {
             return Err(Status::Unsupported);
         }
         if options.label.is_null()
@@ -386,9 +400,7 @@ pub unsafe extern "C" fn cor_engine_unregister(engine: *mut EngineHandle) -> i32
         if engine.is_null() {
             return Ok(());
         }
-        if !unsafe { reference(engine)? }.0.idle()? {
-            return Err(Status::Busy);
-        }
+        unsafe { reference(engine)? }.0.unregister()?;
         unsafe { drop(Box::from_raw(engine)) };
         Ok(())
     })
@@ -486,6 +498,7 @@ pub unsafe extern "C" fn cor_lease_should_yield(
 pub unsafe extern "C" fn cor_lease_release(lease: *mut LeaseHandle) -> i32 {
     boundary(|| {
         if !lease.is_null() {
+            unsafe { reference(lease)? }.0.close()?;
             unsafe { drop(Box::from_raw(lease)) };
         }
         Ok(())
@@ -525,6 +538,32 @@ pub(crate) struct Dispatch {
     pub lease_acquire: unsafe extern "C" fn(*const WorkHandle, u64, *mut *mut LeaseHandle) -> i32,
     pub lease_should_yield: unsafe extern "C" fn(*const LeaseHandle, u64, *mut u32) -> i32,
     pub lease_release: unsafe extern "C" fn(*mut LeaseHandle) -> i32,
+    pub work_begin_ex:
+        unsafe extern "C" fn(*const EngineHandle, *const WorkOptions, *mut *mut WorkHandle) -> i32,
+    pub lease_acquire_ex: unsafe extern "C" fn(
+        *const WorkHandle,
+        *const AcquireOptions,
+        *mut *mut LeaseHandle,
+    ) -> i32,
+    pub lease_acquired: unsafe extern "C" fn(*const LeaseHandle) -> i32,
+    pub lease_register_handler:
+        unsafe extern "C" fn(*mut LeaseHandle, Option<AcquisitionFn>, *mut std::ffi::c_void) -> i32,
+    pub engine_set_memory_handler:
+        unsafe extern "C" fn(*const EngineHandle, Option<MemoryFn>, *mut std::ffi::c_void) -> i32,
+    pub lease_reclaim_memory: unsafe extern "C" fn(
+        *mut LeaseHandle,
+        *const MemoryOptions,
+        Option<ProgressFn>,
+        *mut std::ffi::c_void,
+    ) -> i32,
+    pub reclaim_requirements: unsafe extern "C" fn(
+        *const ReclaimHandle,
+        *mut scheduler::Requirement,
+        u32,
+        *mut u32,
+    ) -> i32,
+    pub reclaim_complete:
+        unsafe extern "C" fn(*mut ReclaimHandle, i32, *const ReleaseReport) -> i32,
 }
 pub(crate) static DISPATCH: Dispatch = Dispatch {
     size: std::mem::size_of::<Dispatch>() as u32,
@@ -549,4 +588,12 @@ pub(crate) static DISPATCH: Dispatch = Dispatch {
     lease_acquire: cor_lease_acquire,
     lease_should_yield: cor_lease_should_yield,
     lease_release: cor_lease_release,
+    work_begin_ex: cor_work_begin_ex,
+    lease_acquire_ex: cor_lease_acquire_ex,
+    lease_acquired: cor_lease_acquired,
+    lease_register_handler: cor_lease_register_handler,
+    engine_set_memory_handler: cor_engine_set_memory_handler,
+    lease_reclaim_memory: cor_lease_reclaim_memory,
+    reclaim_requirements: cor_reclaim_requirements,
+    reclaim_complete: cor_reclaim_complete,
 };

@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "corby/corby.h"
+#include "corby/dispatch.h"
 #include "corby/runtime.h"
 
 #define CHECK(expr) do { if (!(expr)) return __LINE__; } while (0)
@@ -17,6 +18,10 @@ _Static_assert(offsetof(cor_engine_options_t, label) == 8, "label ABI");
 _Static_assert(offsetof(cor_engine_options_t, capabilities) == 24 + 2 * sizeof(void*), "capability ABI");
 _Static_assert(offsetof(cor_engine_stats_t, active_work) == 8, "stats ABI");
 _Static_assert(offsetof(cor_engine_stats_t, capabilities) == 56, "stats capability ABI");
+
+_Static_assert(offsetof(cor_dispatch_v1_t, work_begin_ex) == COR_DISPATCH_V1_REQUIRED_SIZE, "original dispatch prefix");
+_Static_assert(offsetof(cor_acquire_options_t, timeout_ns) == 16, "acquire options ABI");
+_Static_assert(offsetof(cor_memory_progress_t, released_bytes) == 24, "progress ABI");
 
 int main(void) {
     cor_runtime_t* runtime = NULL;

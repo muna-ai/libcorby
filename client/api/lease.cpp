@@ -41,6 +41,8 @@ cor_status_t cor_lease_acquire(
         if (status)
             return status;
         *result = new cor_lease{{c, id}, c->api ? nullptr : c->flag(id), Clock::now()};
+        (*result)->resource = work->resource;
+        (*result)->callbacks->status = COR_OK;
         return COR_OK;
     });
 }
@@ -61,6 +63,13 @@ cor_status_t cor_lease_should_yield(
             return c->api->lease_should_yield(native<cor_lease_t>(lease->id), min_hold_ns, result);
         if (!c->alive.load())
             return COR_UNAVAILABLE;
+        if (lease->resource != COR_RESOURCE_COMPUTE)
+            return COR_UNSUPPORTED;
+        {
+            std::lock_guard guard(lease->callbacks->mutex);
+            if (lease->callbacks->status != COR_OK)
+                return lease->callbacks->status;
+        }
         const auto flags = lease->flags->load();
         const auto held =
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - lease->started)
@@ -75,6 +84,8 @@ cor_status_t cor_lease_release(cor_lease_t* handle) {
         if (!handle)
             return COR_OK;
         auto c = handle->client;
+        if (const auto status = handle->callbacks->close(); status)
+            return status;
         cor_status_t status;
         if (c->api)
             status = c->api->lease_release(native<cor_lease_t>(handle->id));
@@ -83,8 +94,14 @@ cor_status_t cor_lease_release(cor_lease_t* handle) {
             args.u64(handle->id);
             status = c->rpc(19, std::move(args), response);
         }
-        if (!status)
+        if (!status) {
+            c->unwatch(101, handle->id);
+            c->unwatch(103, handle->id);
             delete handle;
+        } else {
+            std::lock_guard guard(handle->callbacks->mutex);
+            handle->callbacks->closed = false;
+        }
         return status;
     });
 }

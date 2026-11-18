@@ -18,10 +18,19 @@ extern "C" {
 #define COR_ABI_VERSION UINT32_C(1)
 #define COR_WAIT_FOREVER UINT64_MAX
 #define COR_CAP_COOPERATIVE_YIELD UINT64_C(1)
+#define COR_CAP_MEMORY_RECLAIM UINT64_C(2)
 #define COR_FEATURE_GROUPS UINT64_C(1)
 #define COR_FEATURE_DEDICATED UINT64_C(2)
 #define COR_FEATURE_CANCELLATION UINT64_C(4)
 #define COR_FEATURE_WEIGHTED_FAIRNESS UINT64_C(8)
+#define COR_FEATURE_MEMORY_LEASES UINT64_C(16)
+#define COR_FEATURE_ASYNC_LEASES UINT64_C(32)
+#define COR_RESOURCE_COMPUTE UINT32_C(0)
+#define COR_RESOURCE_MEMORY UINT32_C(1)
+#define COR_WORK_INTENT_REQUIRED UINT32_C(0)
+#define COR_WORK_INTENT_INITIALIZATION UINT32_C(1)
+#define COR_WORK_INTENT_OPPORTUNISTIC UINT32_C(2)
+#define COR_LEASE_ACQUIRE_FLAGS_ASYNC UINT32_C(1)
 #define COR_TENANCY_SHARED UINT32_C(0)
 #define COR_TENANCY_DEDICATED UINT32_C(1)
 
@@ -37,11 +46,13 @@ typedef int32_t cor_status_t;
 #define COR_INTERNAL INT32_C(8)
 #define COR_NOT_FOUND INT32_C(9)
 #define COR_UNAVAILABLE INT32_C(10)
+#define COR_PENDING INT32_C(11)
 
 typedef struct cor_context cor_context_t;
 typedef struct cor_engine cor_engine_t;
 typedef struct cor_work cor_work_t;
 typedef struct cor_lease cor_lease_t;
+typedef struct cor_reclaim cor_reclaim_t;
 
 typedef struct cor_context_options {
     uint32_t size;
@@ -222,14 +233,141 @@ cor_status_t cor_lease_should_yield(
 );
 
 /*
- * Caller MUST drain all GPU work on all devices before release. Consumes the
- * handle. To yield, drain, release, then acquire again using the same work.
+ * Granted COMPUTE: caller MUST drain all GPU work on all devices first.
+ * MEMORY: finish allocation calls first. PENDING: cancel the queued acquisition.
+ * Failed acquisitions: discard the handle. Successful release consumes it.
+ * To yield, drain, release, then acquire again using the same work.
  */
 cor_status_t cor_lease_release(cor_lease_t* lease);
 
+
+/* Optional ABI-v1 extensions. Unknown flags/intents are rejected. */
+typedef struct cor_work_options {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t resource;
+    uint32_t intent;
+} cor_work_options_t;
+
+typedef struct cor_acquire_options {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t timeout_ns;
+} cor_acquire_options_t;
+
+typedef struct cor_memory_requirement {
+    int32_t device_id;
+    uint32_t reserved;
+    uint64_t bytes;
+} cor_memory_requirement_t;
+
+typedef struct cor_memory_options {
+    uint32_t size;
+    uint32_t abi_version;
+    const cor_memory_requirement_t* requirements;
+    uint32_t requirement_count;
+    uint32_t reserved;
+    uint64_t timeout_ns;
+} cor_memory_options_t;
+
+typedef struct cor_memory_progress {
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t pending;
+    uint32_t completed;
+    uint32_t failed;
+    cor_status_t status;            /* PENDING until all acknowledge, or deadline. */
+    uint64_t released_bytes;        /* Telemetry, never proof an allocation fits. */
+} cor_memory_progress_t;
+
+typedef struct cor_memory_release_report {
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t released_bytes;
+} cor_memory_release_report_t;
+
+typedef void (*cor_lease_acquisition_fn)(cor_lease_t* lease, void* context);
+typedef void (*cor_memory_handler_fn)(cor_reclaim_t* request, void* context);
+typedef void (*cor_memory_progress_fn)(
+    cor_lease_t* lease,
+    const cor_memory_progress_t* progress,
+    void* context
+);
+
+/* NULL options retains compute/required work. Memory initialization intent
+ * suppresses overlapping opportunistic memory growth without reserving bytes.
+ * One pending/held lease per engine PER resource; both domains are independent. */
+cor_status_t cor_work_begin_ex(
+    const cor_engine_t* engine,
+    const cor_work_options_t* options,
+    cor_work_t** result
+);
+
+/* Blocking success returns a granted lease. ASYNC success accepts a request
+ * and returns an opaque pending-or-terminal handle. Never treats PENDING as
+ * permission. timeout_ns covers queueing; zero tries once. NULL = blocking forever. */
+cor_status_t cor_lease_acquire_ex(
+    const cor_work_t* work,
+    const cor_acquire_options_t* options,
+    cor_lease_t** result
+);
+cor_status_t cor_lease_acquired(const cor_lease_t* lease);
+
+/* One handler, delivered exactly once on success OR failure, including late
+ * registration. May run inline when already complete; otherwise on a Corby
+ * completion thread. Enqueue work and return promptly; never block the runtime.
+ * Callbacks execute outside scheduler locks and must not throw across C.
+ * Destruction must not race registration. Release returns BUSY during delivery;
+ * successful release fences/suppresses callbacks not yet executing. */
+cor_status_t cor_lease_register_handler(
+    cor_lease_t* lease,
+    cor_lease_acquisition_fn handler,
+    void* context
+);
+
+/* Notification only: hand the owning request to the engine's safe-boundary
+ * executor. NULL disables future delivery; BUSY if a callback is executing.
+ * Requests already delivered remain valid and must still be completed. */
+cor_status_t cor_engine_set_memory_handler(
+    const cor_engine_t* engine,
+    cor_memory_handler_fn handler,
+    void* context
+);
+
+/* Granted MEMORY lease only, one reclamation operation per lease. Copies the
+ * actual per-device allocation requirements. Pushes progress immediately after
+ * acknowledgements, potentially coalescing concurrent completions. The final
+ * progress has status != PENDING. Release ends interest without invalidating
+ * recipients' tickets. Registered peers lacking a handler report UNSUPPORTED. */
+cor_status_t cor_lease_reclaim_memory(
+    cor_lease_t* lease,
+    const cor_memory_options_t* options,
+    cor_memory_progress_fn handler,
+    void* context
+);
+
+cor_status_t cor_reclaim_requirements(
+    const cor_reclaim_t* request,
+    cor_memory_requirement_t* requirements,
+    uint32_t capacity,
+    uint32_t* needed
+);
+
+/* Acknowledge only AFTER backing is released and device work is synchronized.
+ * Success consumes the ticket, including when the requester already cancelled.
+ * NULL report means no byte telemetry. Zero bytes is a valid successful attempt.
+ * Never pass PENDING as an outcome. Completion is not a memory lease release. */
+cor_status_t cor_reclaim_complete(
+    cor_reclaim_t* request,
+    cor_status_t outcome,
+    const cor_memory_release_report_t* report
+);
+
 /* Thread contract: non-consuming calls may run concurrently. A caller must
  * synchronize destruction against all uses of the same handle, and serialize
- * acquire calls for an engine. Cancellation may run concurrently with acquire.
+ * acquire calls for an engine/resource. Cancellation may run concurrently with acquire.
  * Destroy/end/unregister/release accept NULL. Other pointers must be live,
  * correctly aligned and valid for the documented sizes. Handles cannot be
  * copied, forged, used after consumption, or shared across processes.

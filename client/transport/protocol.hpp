@@ -28,6 +28,11 @@ bool send_frame(
     uint32_t opcode,
     const Bytes& body
 );
+bool read_any_frame(
+    int fd,
+    uint32_t& opcode,
+    Buffer& out
+);
 bool read_frame(
     int fd,
     uint32_t opcode,

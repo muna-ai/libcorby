@@ -7,6 +7,7 @@
 
 #include <span>
 #include <utility>
+#include <vector>
 
 #include "corby/corby.h"
 
@@ -46,11 +47,81 @@ public:
             raw_ = nullptr;
         return status;
     }
-private:
+protected:
     T* raw_ = nullptr;
 };
 
-using Lease = Handle<cor_lease_t, cor_lease_release>;
+enum class Resource : uint32_t { Compute = COR_RESOURCE_COMPUTE, Memory = COR_RESOURCE_MEMORY };
+enum class WorkIntent : uint32_t {
+    Required = COR_WORK_INTENT_REQUIRED,
+    Initialization = COR_WORK_INTENT_INITIALIZATION,
+    Opportunistic = COR_WORK_INTENT_OPPORTUNISTIC
+};
+struct AcquisitionOptions {
+    uint64_t timeout_ns = COR_WAIT_FOREVER;
+    bool asynchronous = false;
+};
+
+class Lease : public Handle<cor_lease_t, cor_lease_release> {
+public:
+    using Handle::Handle;
+    cor_status_t acquired() const noexcept { return cor_lease_acquired(get()); }
+    cor_status_t register_handler(
+        cor_lease_acquisition_fn handler,
+        void* context = nullptr
+    ) const noexcept {
+        return cor_lease_register_handler(get(), handler, context);
+    }
+    cor_status_t reclaim_memory(
+        std::span<const cor_memory_requirement_t> requirements,
+        cor_memory_progress_fn handler,
+        void* context = nullptr,
+        uint64_t timeout_ns = COR_WAIT_FOREVER
+    ) const noexcept {
+        if (requirements.size() > 4096)
+            return COR_INVALID_ARGUMENT;
+        const cor_memory_options_t options{
+            .size = sizeof(cor_memory_options_t),
+            .abi_version = COR_ABI_VERSION,
+            .requirements = requirements.data(),
+            .requirement_count = static_cast<uint32_t>(requirements.size()),
+            .reserved = 0,
+            .timeout_ns = timeout_ns
+        };
+        return cor_lease_reclaim_memory(get(), &options, handler, context);
+    }
+};
+
+inline cor_status_t cancel_reclaim(cor_reclaim_t* request) noexcept {
+    return request ? cor_reclaim_complete(request, COR_CANCELLED, nullptr) : COR_OK;
+}
+class Reclaim : public Handle<cor_reclaim_t, cancel_reclaim> {
+public:
+    using Handle::Handle;
+    Result<std::vector<cor_memory_requirement_t>> requirements() const {
+        uint32_t needed = 0;
+        auto status = cor_reclaim_requirements(get(), nullptr, 0, &needed);
+        if (status)
+            return { .status = status };
+        std::vector<cor_memory_requirement_t> values(needed);
+        status = cor_reclaim_requirements(get(), values.data(), needed, &needed);
+        return { .status = status, .value = std::move(values) };
+    }
+    cor_status_t complete(
+        cor_status_t outcome = COR_OK,
+        uint64_t released_bytes = 0
+    ) noexcept {
+        const cor_memory_release_report_t report{
+            .size = sizeof(cor_memory_release_report_t),
+            .abi_version = COR_ABI_VERSION,
+            .released_bytes = released_bytes
+        };
+        const auto status = cor_reclaim_complete(get(), outcome, &report);
+        if (!status)
+            raw_ = nullptr;
+        return status;
+    }
+};
 
 class Work : public Handle<cor_work_t, cor_work_end> {
 public:
@@ -58,6 +129,18 @@ public:
     Result<Lease> acquire(uint64_t timeout_ns = COR_WAIT_FOREVER) const noexcept {
         cor_lease_t* raw = nullptr;
         const auto status = cor_lease_acquire(get(), timeout_ns, &raw);
+        return { .status = status, .value = Lease(raw) };
+    }
+    Result<Lease> acquire(AcquisitionOptions options) const noexcept {
+        const cor_acquire_options_t raw_options{
+            .size = sizeof(cor_acquire_options_t),
+            .abi_version = COR_ABI_VERSION,
+            .flags = options.asynchronous ? COR_LEASE_ACQUIRE_FLAGS_ASYNC : 0,
+            .reserved = 0,
+            .timeout_ns = options.timeout_ns
+        };
+        cor_lease_t* raw = nullptr;
+        const auto status = cor_lease_acquire_ex(get(), &raw_options, &raw);
         return { .status = status, .value = Lease(raw) };
     }
     cor_status_t cancel() const noexcept { return cor_work_cancel(get()); }
@@ -70,6 +153,26 @@ public:
         cor_work_t* raw = nullptr;
         const auto status = cor_work_begin(get(), &raw);
         return { .status = status, .value = Work(raw) };
+    }
+    Result<Work> begin(
+        Resource resource,
+        WorkIntent intent = WorkIntent::Required
+    ) const noexcept {
+        const cor_work_options_t options{
+            .size = sizeof(cor_work_options_t),
+            .abi_version = COR_ABI_VERSION,
+            .resource = static_cast<uint32_t>(resource),
+            .intent = static_cast<uint32_t>(intent)
+        };
+        cor_work_t* raw = nullptr;
+        const auto status = cor_work_begin_ex(get(), &options, &raw);
+        return { .status = status, .value = Work(raw) };
+    }
+    cor_status_t set_memory_handler(
+        cor_memory_handler_fn handler,
+        void* context = nullptr
+    ) const noexcept {
+        return cor_engine_set_memory_handler(get(), handler, context);
     }
     cor_status_t retire() const noexcept { return cor_engine_retire(get()); }
     cor_status_t set_weight(uint32_t weight) const noexcept {

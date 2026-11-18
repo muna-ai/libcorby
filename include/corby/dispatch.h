@@ -87,6 +87,45 @@ typedef struct cor_dispatch_v1 {
         uint32_t* result
     );
     cor_status_t (*lease_release)(cor_lease_t* lease);
+    /* Optional v1 extensions: check size and feature bits before reading. */
+    cor_status_t (*work_begin_ex)(
+        const cor_engine_t*,
+        const cor_work_options_t*,
+        cor_work_t**
+    );
+    cor_status_t (*lease_acquire_ex)(
+        const cor_work_t*,
+        const cor_acquire_options_t*,
+        cor_lease_t**
+    );
+    cor_status_t (*lease_acquired)(const cor_lease_t*);
+    cor_status_t (*lease_register_handler)(
+        cor_lease_t*,
+        cor_lease_acquisition_fn,
+        void*
+    );
+    cor_status_t (*engine_set_memory_handler)(
+        const cor_engine_t*,
+        cor_memory_handler_fn,
+        void*
+    );
+    cor_status_t (*lease_reclaim_memory)(
+        cor_lease_t*,
+        const cor_memory_options_t*,
+        cor_memory_progress_fn,
+        void*
+    );
+    cor_status_t (*reclaim_requirements)(
+        const cor_reclaim_t*,
+        cor_memory_requirement_t*,
+        uint32_t,
+        uint32_t*
+    );
+    cor_status_t (*reclaim_complete)(
+        cor_reclaim_t*,
+        cor_status_t,
+        const cor_memory_release_report_t*
+    );
 } cor_dispatch_v1_t;
 
 /* Freeze this original prefix even when optional entries are appended. */

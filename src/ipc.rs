@@ -1,4 +1,4 @@
-/* 
+/*
 *   Corby
 *   Copyright © 2026 NatML Inc. All rights reserved.
 */
@@ -6,14 +6,16 @@
 //! Versioned, bounded, little-endian messages. Mutable scheduler state never
 //! crosses the process boundary. Each RPC has its own stream so a pending grant
 //! cannot block a release/cancel on the session's other requests.
+mod extensions;
 use crate::runtime::Inner;
-use crate::scheduler::{Engine, Lease, Work};
+use crate::scheduler::{Engine, Lease, Reclaim, Work};
 use crate::{EngineStats, Status, FEATURES};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -87,15 +89,29 @@ enum Object {
     Engine(Arc<Engine>),
     Work(Arc<Work>),
     Lease(Arc<Lease>),
+    Reclaim(Arc<Reclaim>),
 }
 
 struct Session {
     objects: Mutex<BTreeMap<u64, Object>>,
     next: AtomicU64,
     closed: AtomicBool,
+    notifications: SyncSender<Option<(u32, Vec<u8>)>>,
+    control: UnixStream,
 }
 
 impl Session {
+    fn notify(&self, opcode: u32, body: Vec<u8>) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        // Scheduler callbacks only enqueue. A slow/disconnected peer must not
+        // stall grants or warning delivery to another engine.
+        if self.notifications.try_send(Some((opcode, body))).is_err() {
+            self.closed.store(true, Ordering::Release);
+            let _ = self.control.shutdown(std::net::Shutdown::Both);
+        }
+    }
 
     /// Insert a new object into the session.
     fn insert(&self, object: Object) -> std::result::Result<u64, Status> {
@@ -103,10 +119,11 @@ impl Session {
         if id == u64::MAX {
             return Err(Status::Internal);
         }
-        self.objects
-            .lock()
-            .map_err(|_| Status::Internal)?
-            .insert(id, object);
+        let mut objects = self.objects.lock().map_err(|_| Status::Internal)?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Status::Unavailable);
+        }
+        objects.insert(id, object);
         Ok(id)
     }
 
@@ -134,15 +151,30 @@ impl Session {
     /// Disconnect the session.
     fn disconnect(&self) {
         self.closed.store(true, Ordering::Release);
+        let _ = self.notifications.try_send(None);
+        let _ = self.control.shutdown(std::net::Shutdown::Both);
         if let Ok(mut objects) = self.objects.lock() {
             for object in objects.values() {
                 if let Object::Work(work) = object {
                     let _ = work.cancel();
                 }
             }
+            // A lost peer cannot promise reclamation success, even if its
+            // compute permission must remain quarantined.
+            objects.retain(|_, o| !matches!(o, Object::Reclaim(_)));
             // A broken control connection is not proof of a drained GPU. Keep
             // uncertain holders AND their demand/reservations quarantined.
-            if !objects.values().any(|o| matches!(o, Object::Lease(_))) {
+            for object in objects.values() {
+                if let Object::Lease(lease) = object {
+                    if lease.acquired() != Ok(()) {
+                        let _ = lease.close();
+                    }
+                }
+            }
+            if !objects
+                .values()
+                .any(|o| matches!(o, Object::Lease(l) if l.acquired() == Ok(())))
+            {
                 objects.clear();
             }
         }
@@ -257,7 +289,7 @@ fn reply(stream: &mut UnixStream, opcode: u32, result: Reply) -> std::io::Result
     send(stream, opcode, &body)
 }
 
-fn execute(inner: &Inner, session: &Session, opcode: u32, bytes: &[u8]) -> Reply {
+fn execute(inner: &Inner, session: &Arc<Session>, opcode: u32, bytes: &[u8]) -> Reply {
     if session.closed.load(Ordering::Acquire) || inner.stopping.load(Ordering::Acquire) {
         return Err(Status::Unavailable);
     }
@@ -315,7 +347,7 @@ fn execute(inner: &Inner, session: &Session, opcode: u32, bytes: &[u8]) -> Reply
             let tenancy = d.u32()?;
             let capabilities = d.u64()?;
             d.finish()?;
-            if capabilities & !crate::CAP_COOPERATIVE != 0 {
+            if capabilities & !(crate::CAP_COOPERATIVE | crate::CAP_MEMORY_RECLAIM) != 0 {
                 return Err(Status::Unsupported);
             }
             let engine =
@@ -332,6 +364,21 @@ fn execute(inner: &Inner, session: &Session, opcode: u32, bytes: &[u8]) -> Reply
                 _ => 0,
             };
             d.finish()?;
+            // Exclude the yield observer until the released object is removed.
+            // Otherwise it could observe a closed lease between close/remove and
+            // mistake the missing holder for a corrupt coordinator.
+            if opcode == 19 {
+                let mut objects = session.objects.lock().map_err(|_| Status::Internal)?;
+                match objects.get(&id) {
+                    Some(Object::Lease(l)) => l.close()?,
+                    None => return Ok(out),
+                    _ => return Err(Status::InvalidArgument),
+                }
+                let removed = objects.remove(&id);
+                drop(objects);
+                drop(removed);
+                return Ok(out);
+            }
             // Consuming commands are idempotent within this session/incarnation.
             let object = match session.get(id) {
                 Ok(o) => o,
@@ -341,9 +388,7 @@ fn execute(inner: &Inner, session: &Session, opcode: u32, bytes: &[u8]) -> Reply
             match (opcode, object) {
                 (9, Object::Engine(e)) => e.retire()?,
                 (10, Object::Engine(e)) => {
-                    if !e.idle()? {
-                        return Err(Status::Busy);
-                    }
+                    e.unregister()?;
                     session.remove(id)?;
                 }
                 (11, Object::Engine(e)) => e.set_weight(parameter as u32)?,
@@ -368,24 +413,24 @@ fn execute(inner: &Inner, session: &Session, opcode: u32, bytes: &[u8]) -> Reply
                     session.insert(Object::Lease(Arc::new(w.acquire(parameter)?)))?,
                 ),
                 (18, Object::Lease(l)) => put32(&mut out, u32::from(l.should_yield(parameter)?)),
-                (19, Object::Lease(_)) => session.remove(id)?,
+                (19, Object::Lease(l)) => {
+                    l.close()?;
+                    session.remove(id)?;
+                }
                 _ => return Err(Status::InvalidArgument),
             }
         }
+        20..=27 => return extensions::execute(session, opcode, &mut d),
         _ => return Err(Status::Unsupported),
     }
     Ok(out)
 }
 
 /// Monitor the session for changes.
-fn monitor(
-    inner: &Inner,
-    session: &Session,
-    stream: &mut UnixStream,
-) -> std::io::Result<()> {
+fn monitor(inner: &Inner, session: &Session, stream: &mut UnixStream) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(1)))?;
     let mut published = BTreeMap::new();
-    while !inner.stopping.load(Ordering::Acquire) {
+    while !inner.stopping.load(Ordering::Acquire) && !session.closed.load(Ordering::Acquire) {
         let mut byte = [0];
         match stream.read(&mut byte) {
             Ok(_) => break, // EOF, or invalid traffic on the server-push channel.
@@ -411,6 +456,9 @@ fn monitor(
                 let Object::Lease(lease) = object else {
                     continue;
                 };
+                if lease.acquired() != Ok(()) || lease.work.resource != crate::scheduler::COMPUTE {
+                    continue;
+                }
                 let flags = if lease
                     .should_yield(u64::MAX)
                     .map_err(|_| std::io::ErrorKind::Other)?
@@ -435,7 +483,7 @@ fn monitor(
         }
         // Never hold scheduler/session locks while writing to a slow peer.
         for out in notifications {
-            send(stream, 100, &out)?;
+            session.notify(100, out);
         }
         published = present;
     }
@@ -443,10 +491,7 @@ fn monitor(
 }
 
 /// Handle a new connection.
-fn connection(
-    inner: Arc<Inner>,
-    mut stream: UnixStream,
-) -> std::io::Result<()> {
+fn connection(inner: Arc<Inner>, mut stream: UnixStream) -> std::io::Result<()> {
     if !same_user(&stream) {
         return Err(std::io::ErrorKind::PermissionDenied.into());
     }
@@ -464,10 +509,13 @@ fn connection(
         }
         let mut token = [0u8; 16];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut token)?;
+        let (notifications, receiver) = sync_channel(8192);
         let session = Arc::new(Session {
             objects: Default::default(),
             next: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            notifications,
+            control: stream.try_clone()?,
         });
         inner
             .sessions
@@ -478,9 +526,26 @@ fn connection(
         let mut out = Vec::new();
         put64(&mut out, FEATURES);
         out.extend(token);
-        let result =
-            reply(&mut stream, 0, Ok(out)).and_then(|_| monitor(&inner, &session, &mut stream));
+        reply(&mut stream, 0, Ok(out))?;
+        let mut push = stream.try_clone()?;
+        let weak = Arc::downgrade(&session);
+        let writer = std::thread::Builder::new()
+            .name("corby-push".into())
+            .spawn(move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(Some((opcode, body))) = receiver.recv() {
+                        if send(&mut push, opcode, &body).is_err() {
+                            break;
+                        }
+                    }
+                }));
+                if let Some(session) = weak.upgrade() {
+                    session.disconnect();
+                }
+            })?;
+        let result = monitor(&inner, &session, &mut stream);
         session.disconnect();
+        let _ = writer.join();
         // Keep quarantined objects pinned. Empty sessions can be removed only
         // after their last in-flight request has finished (Arc strong count).
         result
@@ -512,10 +577,7 @@ fn connection(
 }
 
 /// Serve the IPC server.
-pub(crate) fn serve(
-    inner: Arc<Inner>,
-    listener: UnixListener,
-) -> std::result::Result<(), Status> {
+pub(crate) fn serve(inner: Arc<Inner>, listener: UnixListener) -> std::result::Result<(), Status> {
     std::thread::Builder::new()
         .name("corby-listener".into())
         .spawn(move || {
@@ -523,6 +585,9 @@ pub(crate) fn serve(
             while !inner.stopping.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if inner.stopping.load(Ordering::Acquire) {
+                            break;
+                        }
                         if inner.sessions.workers.fetch_add(1, Ordering::AcqRel) >= 128 {
                             inner.sessions.workers.fetch_sub(1, Ordering::AcqRel);
                             continue;
@@ -547,9 +612,6 @@ pub(crate) fn serve(
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1))
-                    }
                     Err(_) => {
                         let _ = inner.coordinator.retire();
                         inner.coordinator.cancel_all();

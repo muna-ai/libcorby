@@ -125,7 +125,8 @@ compilers are supported requirements. Current platform support is Linux/macOS.
   end only after native execution and stream cleanup. Multiple requests can
   contribute work to one engine.
 - A **lease** grants the complete group atomically. One acquire or held lease may
-  be outstanding per engine. Never wait on another engine's progress while held.
+  be outstanding per engine **per resource**. Compute and memory permission
+  are independent; see [memory coordination](docs/memory.md).
 - Shared contenders use stride scheduling charged by actual wall-clock held
   time divided by weight. Returning engines do not accumulate idle credit.
   Queue precedence prevents single-device arrivals starving an older group.
@@ -142,6 +143,25 @@ Cancellation is sticky and wakes waiters. It requests a holder to yield but
 never releases permission or clears its work demand automatically. Timeout and
 cancellation leave no queued request or partial group. For a cooperative yield,
 drain all streams, release, then acquire again on the same work scope.
+
+## Memory leases and async acquisition
+
+Memory leases coordinate backing-memory growth without predeclared model
+budgets. Engines provide actual per-device allocation requirements after OOM;
+residents receive opaque reclamation tickets, reclaim at their own safe
+boundaries, and acknowledge completion. Progress wakes the requester directly,
+allowing retries before every resident finishes. Compute can continue while a
+memory lease is held. Initialization work suppresses opportunistic cache
+regrowth between short allocation leases without serializing whole loads.
+
+The same opaque lease can represent a pending async acquisition. The additive
+APIs `cor_lease_acquire_ex`, `cor_lease_acquired` and
+`cor_lease_register_handler` support success, timeout and cancellation with
+exactly-once completion notification. Blocking compute calls are unchanged.
+C++ and safe Rust frontends expose both resource domains.
+
+See [memory coordination](docs/memory.md) for API examples, acknowledgement
+semantics, callback ownership and the allocation lifecycle.
 
 ## Shutdown and failures
 
@@ -181,7 +201,9 @@ cargo fmt --all -- --check
 The host-enabled native suite tests local C/C++ clients, independent statically
 linked DSOs, and an exec'd worker sharing one runtime. It covers blocked IPC
 acquire cancellation, finite timeout cleanup, metadata/policy access, dedicated
-push notifications, synchronous release ordering and crash quarantine. Rust
+push notifications, synchronous release ordering and crash quarantine.
+Memory tests cover native and socket clients, including an exec'd C++ worker,
+partial reclamation, resource independence and async completion. Rust
 tests cover the scheduler, runtime lifecycle and bounded message decoding.
 Socket tests need local Unix-socket binding and process spawning permissions.
 These are CPU tests; real GPU drain/TP-barrier validation remains with engines.

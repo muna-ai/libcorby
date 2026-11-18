@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,28 @@ struct Connection {
     std::string endpoint;
     int control = -1;
     Bytes token;
+    uint64_t features = 0;
+    using Event = std::function<void(Buffer)>;
+    std::mutex events_mutex;
+    std::map<std::pair<uint32_t, uint64_t>, Event> events;
+    void watch(
+        uint32_t opcode,
+        uint64_t id,
+        Event handler
+    );
+    void unwatch(
+        uint32_t opcode,
+        uint64_t id
+    );
+    void deliver(
+        uint32_t opcode,
+        uint64_t id,
+        Buffer body
+    );
+    static void failed_event(
+        uint32_t opcode,
+        const Event& handler
+    );
     std::atomic<bool> alive{true};
     std::thread reader;
     std::mutex flags_mutex;
